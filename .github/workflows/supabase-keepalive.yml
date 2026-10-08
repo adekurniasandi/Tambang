@@ -1,0 +1,28 @@
+name: Supabase Keepalive
+
+on:
+  schedule:
+    - cron: "17 */12 * * *"
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping Supabase
+        env:
+          SUPABASE_URL: https://gdfvzfqherygmiqyvvsy.supabase.co
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+          code="$(curl -sS -o /tmp/supabase-response.txt -w "%{http_code}" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            "$SUPABASE_URL/rest/v1/unit_status_actual?select=unit_id&limit=1")"
+          echo "Supabase HTTP status: $code"
+          if [ "$code" -ge 500 ]; then
+            cat /tmp/supabase-response.txt
+            exit 1
+          fi
+          echo "Supabase API responded; database activity generated."
