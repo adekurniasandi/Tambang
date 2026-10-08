@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MINEBOARD // Enterprise Mining Operations Dashboard</title>
+<!-- [FIX loading] Buka koneksi (DNS+TLS) lebih awal ke origin yang pasti dipakai -->
+<link rel="preconnect" href="https://gdfvzfqherygmiqyvvsy.supabase.co" crossorigin>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="preconnect" href="https://cdn.tailwindcss.com" crossorigin>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="dns-prefetch" href="https://cdnjs.cloudflare.com">
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"></script>
+<!-- [PERF] html2canvas/jsPDF/XLSX hanya dipakai oleh fungsi export (PDF/Excel) yang
+     dipanggil belakangan lewat klik user, jauh setelah DOMContentLoaded — bukan saat
+     startup/initial render. Aman diberi `defer` agar tidak lagi render-blocking di
+     <head>; browser tetap mengunduhnya paralel tapi baru dieksekusi setelah HTML
+     selesai di-parse, sebelum DOMContentLoaded (jadi tetap siap dipakai kapan pun user
+     klik export, tidak ada race condition). Chart.js & datalabels TIDAK disentuh karena
+     Chart.register(ChartDataLabels) jalan sinkron saat parsing inline script utama. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="antialiased">
+
+<div id="loadOverlay">
+  <div class="w-14 h-14 rounded-2xl flex items-center justify-center font-display font-bold text-sm" style="background:linear-gradient(135deg, var(--accent), #ff8a00); color:#1a1204; box-shadow:var(--shadow-glow); animation:scaleIn .5s var(--ease);">MB</div>
+  <div class="spinner"></div>
+  <div class="font-mono text-xs tracking-widest" style="color:var(--text-dim)">MEMUAT DATA OPERASIONAL TAMBANG...</div>
+</div>
+
+<div class="flex">
+
+  <aside id="sidebar">
+    <div class="flex items-center gap-3 px-4 py-4 border-b" style="border-color:var(--border)">
+      <div class="w-9 h-9 rounded-xl flex items-center justify-center font-mono font-bold text-sm flex-shrink-0" style="background:linear-gradient(135deg, var(--accent), #ff8a00); color:#1a1204; box-shadow:var(--shadow-glow);">MB</div>
+      <div class="brand-text">
+        <div class="font-display text-sm font-semibold" style="color:var(--text)">MINEBOARD</div>
+        <div class="text-[10px] font-mono" style="color:var(--text-faint)">MCC OPS SYSTEM</div>
+      </div>
+    </div>
+    <nav id="navList" class="flex-1 overflow-y-auto scrollbar-thin py-2"></nav>
+    <div class="px-3 py-3 border-t" style="border-color:var(--border)">
+      <button onclick="toggleSidebar()" class="btn w-full justify-center" aria-label="Ciutkan atau perluas sidebar">
+        <span id="sbToggleIcon">⟨⟨</span> <span class="side-label">Ciutkan</span>
+      </button>
+    </div>
+  </aside>
+
+  <div id="sidebarOverlay" aria-hidden="true" onclick="closeMobileSidebar()"></div>
+
+  <div class="flex-1 min-w-0">
+    <div id="topbar">
+      <div class="flex items-center justify-between px-4 py-2.5 gap-3 flex-wrap">
+        <div class="flex items-center gap-2 min-w-0">
+          <button onclick="toggleMobileSidebar()" class="btn lg:hidden !px-2" aria-label="Buka menu navigasi">☰</button>
+          <div class="min-w-0">
+            <div id="pageBreadcrumb" class="breadcrumb"></div>
+            <div id="pageTitle" class="font-display text-lg font-semibold tracking-wide truncate">OVERVIEW</div>
+            <div id="pageSub" class="text-[11px] truncate" style="color:var(--text-faint)">Ringkasan operasional tambang seluruh site</div>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <div class="qsearch-wrap hidden md:block">
+            <span class="qsearch-icon">🔍</span>
+            <input id="qsearchInput" class="qsearch-input" type="text" placeholder="Cari halaman..." autocomplete="off"
+              oninput="qsearchRun(this.value)" onkeydown="qsearchKey(event)" onblur="setTimeout(qsearchClose,150)" onfocus="qsearchRun(this.value)" />
+            <div id="qsearchResults" class="qsearch-results"></div>
+          </div>
+          <button id="dataStatusChip" class="dl-chip loading" type="button" role="status" aria-live="polite" onclick="dataChipClick()" title="Memuat data…"><i class="dl-dot"></i><span id="dataStatusTxt">Loading data 0%</span></button>
+          <span id="liveClock" class="tag font-mono"></span>
+          <button onclick="toggleTheme()" class="btn" id="themeBtn" aria-label="Ganti tema terang/gelap">🌙 Dark</button>
+        </div>
+      </div>
+      <div class="flex items-center gap-2 px-4 pb-2.5 flex-wrap" id="filterBar"></div>
+    </div>
+
+    <main id="pageContent" class="p-4"></main>
+  </div>
+</div>
+
+<script src="app.js"></script>
+
+<script src="mineplan.js"></script>
+</body>
+</html>
