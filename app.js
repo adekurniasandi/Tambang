@@ -79,7 +79,8 @@ const U = {
     last = msg; lastAt = now;
     try{
       if(document.body && typeof showToast === 'function'){
-        const safe = msg.replace(/[&<>"']/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])).slice(0,160);
+        // [SEC 2026-10] showToast() sudah meng-escape pesannya sendiri — kirim teks mentah (dipotong).
+        const safe = String(msg).slice(0,160);
         showToast('Terjadi kesalahan: ' + safe, 'error');
       }
     }catch(_){}
@@ -777,7 +778,9 @@ function fetchErrIsTransient(error, status){
 }
 const _sleep = ms => new Promise(r=>setTimeout(r, ms));
 // Satu halaman = satu range() tetap. Mengembalikan array baris halaman tsb dari percobaan yang SUKSES saja.
-async function fetchPageWithRetry(table, columns, orderCol, pageIdx){
+// [PERF 2026-10 · PROGRESSIVE] dateFilter opsional {col, op:'gte'|'lt', val} -> filter SERVER-SIDE
+// (diterapkan SEBELUM range()), dipakai fase hot-window (gte) & history-fill (lt).
+async function fetchPageWithRetry(table, columns, orderCol, pageIdx, dateFilter){
   const from = pageIdx * FETCH_PAGE_SIZE, to = from + FETCH_PAGE_SIZE - 1;
   let lastErr = null;
   for(let attempt = 0; attempt <= MAX_RETRIES; attempt++){
@@ -786,7 +789,11 @@ async function fetchPageWithRetry(table, columns, orderCol, pageIdx){
     const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     const timer = ctrl ? setTimeout(()=>ctrl.abort(), FETCH_TIMEOUT_MS) : null;
     try{
-      let q = sb.from(table).select(columns).range(from, to);
+      let q = sb.from(table).select(columns);
+      if(dateFilter && dateFilter.col){
+        q = dateFilter.op === 'lt' ? q.lt(dateFilter.col, dateFilter.val) : q.gte(dateFilter.col, dateFilter.val);
+      }
+      q = q.range(from, to);
       if(orderCol) (Array.isArray(orderCol) ? orderCol : [orderCol]).forEach(c=>{ q = q.order(c, { ascending:true }); });
       if(ctrl && typeof q.abortSignal === 'function') q = q.abortSignal(ctrl.signal);
       const { data, error, status } = await q;
@@ -851,10 +858,12 @@ function _queueCacheWrite(key, rows){
   };
   _cacheIdle(run);
 }
-async function fetchAll(table, columns='*', orderCol=null, meta=null){
+async function fetchAll(table, columns='*', orderCol=null, meta=null, dateFilter=null){
   /* [HARDENING] `meta` (opsional) diisi: meta.source = 'network' | 'cache' (offline) | 'cache-fallback'
      (network gagal, cache dipakai) dan meta.error. Dipakai DATA_STATE supaya data cache TIDAK pernah
-     dianggap data fresh dari server. Kontrak return/meta/cache-fallback TIDAK berubah. */
+     dianggap data fresh dari server. Kontrak return/meta/cache-fallback TIDAK berubah.
+     [PERF 2026-10 · PROGRESSIVE] `dateFilter` opsional {col, op, val} diteruskan ke
+     fetchPageWithRetry (filter server-side). Diabaikan saat offline (cache utuh dikembalikan). */
   // [OFFLINE ENGINE] Jika status koneksi sudah diketahui offline, langsung pakai cache
   // IndexedDB tanpa mencoba request ke Supabase sama sekali (lebih cepat & tidak error).
   if(typeof OfflineEngine!=='undefined' && OfflineEngine.isOffline && OfflineEngine.isOffline()){
@@ -868,7 +877,7 @@ async function fetchAll(table, columns='*', orderCol=null, meta=null){
     const logBatch = (rows, since)=>{ if(MB_DEBUG_FETCH) console.info(`[Mineboard] ${table}: batch ${batchNo}, rows=${rows}, elapsed=${Math.round(performance.now()-since)}ms`); };
     // Halaman 0 sendirian -> tabel kecil selesai 1 request, tanpa request kosong tambahan.
     let tb = performance.now();
-    const first = await fetchPageWithRetry(table, columns, orderCol, 0);
+    const first = await fetchPageWithRetry(table, columns, orderCol, 0, dateFilter);
     batchNo++; nextPage = 1;
     if(first.length){ chunks.push(first); total += first.length; }
     logBatch(first.length, tb);
@@ -877,7 +886,7 @@ async function fetchAll(table, columns='*', orderCol=null, meta=null){
       const idxs = [];
       for(let i=0;i<BATCH_CONCURRENCY;i++) idxs.push(nextPage + i);
       tb = performance.now();
-      const results = await Promise.all(idxs.map(p=> fetchPageWithRetry(table, columns, orderCol, p)));   // urutan = urutan halaman
+      const results = await Promise.all(idxs.map(p=> fetchPageWithRetry(table, columns, orderCol, p, dateFilter)));   // urutan = urutan halaman
       batchNo++;
       let waveRows = 0;
       for(const data of results){
@@ -1115,6 +1124,28 @@ async function applyLoadedTables(t){
 }
 
 /* ============================================================
+   [PERF 2026-10 · PROGRESSIVE LOAD — dua fase, tanpa mengubah data]
+   ------------------------------------------------------------
+   Masalah: loadAllData() menarik SELURUH isi tabel fakta (unit_status_actual
+   ~288rb baris, production_actual ~109rb, dst. — total ~500rb baris / 100MB+)
+   dan dashboard baru tampil setelah semuanya selesai (gate 100%).
+   Perbaikan: fase A hanya menarik "jendela panas" (HOT_WINDOW_DAYS terakhir)
+   dengan filter tanggal SERVER-SIDE (.gte di Supabase, bukan di browser),
+   lalu dashboard langsung dirender. Fase B (fillHistoryInBackground, di bawah)
+   menarik sisa data lama di background, menggabungkannya, dan me-render ulang.
+   - Tidak ada baris yang diubah/dihilangkan: gte(cutoff) + lt(cutoff) = disjoint
+     & lengkap (union = seluruh tabel).
+   - Urutan tetap ascending per kolom tanggal di kedua fase, jadi
+     older.concat(hot) = urutan kronologis benar tanpa sort ulang.
+   - Saat offline/cache: fetchAll mengembalikan cache utuh (filter diabaikan)
+     dan fase B melewatkan merge (meta.source !== 'network') agar tidak dobel.
+   ============================================================ */
+const HOT_WINDOW_DAYS = 90;
+function hotWindowCutoffISO(){
+  const d = new Date(); d.setDate(d.getDate() - HOT_WINDOW_DAYS);
+  return d.toISOString().slice(0,10);   // YYYY-MM-DD
+}
+/* ============================================================
    [HARDENING] DATA LOAD STATE — status / progress / partial / retry
    ------------------------------------------------------------
    Satu sumber kebenaran status load dashboard. Progress per fase: Connecting 10 > Loading data 10-85 (bobot TABEL yang benar-benar selesai di-fetch,
@@ -1131,13 +1162,13 @@ const DATA_SPEC = [
   { key:'unitsRaw',     table:'master_units',     cols:'unit_code,unit_name,unit_role_code,capacity,is_active,equipment_type,equipment_category', group:'master', w:20/6, label:'Master Unit' },
   { key:'empRaw',       table:'master_employees', cols:'employee_code,employee_name,position,is_active', group:'master', w:20/6, label:'Master Karyawan' },
   { key:'materialsRaw', table:'master_materials', cols:'material_code,material_name,material_category,production_stream,density_t_bcm', group:'master', w:20/6, label:'Master Material' },
-  { key:'prodRaw',      table:'production_actual', cols:'actual_date,hour_label,shift_code,location_code,fleet_code,digger_unit_code,hauler_unit_code,operator_code,driver_code,material_code,ritase,distance_km,production_volume,volume_unit,assignment_source', order:'actual_date', group:'fact', w:20, label:'Production' },
-  { key:'minePlanRaw',  table:'plan_daily_generated', cols:null /* MINE_PLAN_COLS */, order:['plan_date','gen_id'], group:'fact', w:3, label:'Mine Plan' },
-  { key:'statusRaw',    table:'unit_status_actual', cols:'status_date,shift_code,unit_code,fleet_code,status,category,duration_hours,data_source,hour_label', order:'status_date', group:'fact', w:25, label:'Unit Status' },
-  { key:'fuelRaw',      table:'fuel_actual',      cols:'fuel_date,shift_code,unit_code,fleet_code,fuel_liters,operating_hours,data_source', order:'fuel_date', group:'fact', w:8, label:'Fuel' },
-  { key:'delayRaw',     table:'delay_events',     cols:'event_date,shift_code,fleet_code,unit_code,delay_code,duration_hours,hour_label', order:'event_date', group:'fact', w:5, label:'Delay' },
-  { key:'idleRaw',      table:'idle_events',      cols:'event_date,shift_code,scope,fleet_code,unit_code,idle_code,duration_hours,hour_label', order:'event_date', group:'fact', w:5, label:'Idle' },
-  { key:'otRaw',        table:'ot_events',        cols:'event_date,shift_code,unit_code,fleet_code,hour_label,duration_hours,source', order:'event_date', group:'fact', w:2, label:'OT' },
+  { key:'prodRaw',      table:'production_actual', cols:'actual_date,hour_label,shift_code,location_code,fleet_code,digger_unit_code,hauler_unit_code,operator_code,driver_code,material_code,ritase,distance_km,production_volume,volume_unit,assignment_source', order:'actual_date', dateCol:'actual_date', group:'fact', w:20, label:'Production' },
+  { key:'minePlanRaw',  table:'plan_daily_generated', cols:null /* MINE_PLAN_COLS */, order:['plan_date','gen_id'], dateCol:'plan_date', group:'fact', w:3, label:'Mine Plan' },
+  { key:'statusRaw',    table:'unit_status_actual', cols:'status_date,shift_code,unit_code,fleet_code,status,category,duration_hours,data_source,hour_label', order:'status_date', dateCol:'status_date', group:'fact', w:25, label:'Unit Status' },
+  { key:'fuelRaw',      table:'fuel_actual',      cols:'fuel_date,shift_code,unit_code,fleet_code,fuel_liters,operating_hours,data_source', order:'fuel_date', dateCol:'fuel_date', group:'fact', w:8, label:'Fuel' },
+  { key:'delayRaw',     table:'delay_events',     cols:'event_date,shift_code,fleet_code,unit_code,delay_code,duration_hours,hour_label', order:'event_date', dateCol:'event_date', group:'fact', w:5, label:'Delay' },
+  { key:'idleRaw',      table:'idle_events',      cols:'event_date,shift_code,scope,fleet_code,unit_code,idle_code,duration_hours,hour_label', order:'event_date', dateCol:'event_date', group:'fact', w:5, label:'Idle' },
+  { key:'otRaw',        table:'ot_events',        cols:'event_date,shift_code,unit_code,fleet_code,hour_label,duration_hours,source', order:'event_date', dateCol:'event_date', group:'fact', w:2, label:'OT' },
   { key:'delayCodeRaw', table:'master_delays',    cols:'delay_code,delay_name', group:'fact', w:1, label:'Kode Delay' },
   { key:'idleCodeRaw',  table:'master_idles',     cols:'idle_code,idle_name', group:'fact', w:1, label:'Kode Idle' }
 ];
@@ -1148,6 +1179,8 @@ const DATA_STATE = {
   fromCache:false,       // seluruh data berasal dari cache IndexedDB (offline), bukan server
   refreshing:false,      // reload latar belakang (realtime/refresh) — data lama tetap valid dan tampil
   busy:false, tok:0, retries:0, loadedAt:null,
+  backgroundSync:false, // [PERF 2026-10 · PROGRESSIVE] fase B history-fill sedang berjalan di background
+  histProgress:0,       // [PERF 2026-10 · PROGRESSIVE] progres fase B (0-100) untuk chip
   phase:'Connecting', cacheAt:null,   // [P1 progress] Connecting > Loading data > Processing > Rendering > Ready; cacheAt = waktu cache tertua yang sedang ditampilkan
   done:{}, failed:{}, stale:{}, srcCache:{},
   modelMissing:[]        // key tabel yang TIDAK punya data sama sekali di model saat ini (bukan sekadar kosong)
@@ -1177,6 +1210,7 @@ function dataStateRender(){
   let cls, txt;
   if(S.status==='loading'){ cls='loading'; txt = `${S.fromCache ? 'Syncing' + dataStateCacheTag() : (S.phase || 'Loading data')} ${p}%`; }   // 'Syncing' = dashboard sudah tampil dari cache, menunggu server
   else if(S.refreshing){ cls='loading'; txt = `Refreshing ${p}%`; }
+  else if(S.status==='ready' && S.backgroundSync){ cls='loading'; txt = `Memuat data lama ${Math.round(S.histProgress||0)}%`; }  // [PERF 2026-10 · PROGRESSIVE] fase B
   else if(S.status==='ready' && p < 100){ cls='loading'; txt = `Rendering ${p}%`; }   // 100% hanya setelah render selesai
   else if(S.status==='ready'){ cls='ready'; txt = `${S.fromCache ? '✓ Cache' : '✓ Ready'} 100%`; }
   else if(S.status==='partial'){ cls='partial'; txt = '⚠ Data incomplete · Retry'; }
@@ -1213,6 +1247,12 @@ async function loadAllData(opts){
   const S = DATA_STATE, tok = ++S.tok;
   const retry = !!(opts.only && opts.only.length && DATA_RAW);
   const background = !!opts.background && S.hasData && !retry;
+  // [PERF 2026-10 · PROGRESSIVE] twoPhase HANYA saat boot awal tanpa data sama sekali
+  // (bukan retry, bukan refresh realtime/background, bukan saat dashboard sudah tampil
+  // dari cache — kasus-kasus itu tetap memakai perilaku lama satu fase penuh).
+  const twoPhase = !S.hasData && !retry && !background;
+  const hotCutoff = twoPhase ? hotWindowCutoffISO() : null;
+  const hotFilterFor = sp=> (hotCutoff && sp.dateCol) ? { col:sp.dateCol, op:'gte', val:hotCutoff } : null;
   const raw = retry ? Object.assign({}, DATA_RAW) : {};
   const stale = {};
   S.done = {}; S.failed = {}; S.srcCache = {}; S.error = null; S.busy = true;
@@ -1226,7 +1266,9 @@ async function loadAllData(opts){
   const step = async sp=>{
     const meta = {};
     try{
-      const rows = await fetchAll(sp.table, sp.cols || MINE_PLAN_COLS, sp.order || null, meta);
+      // [PERF 2026-10 · PROGRESSIVE] Fase A: tabel fakta hanya menarik HOT_WINDOW_DAYS
+      // terakhir (filter server-side). Tabel master (tanpa dateCol) tetap penuh (kecil).
+      const rows = await fetchAll(sp.table, sp.cols || MINE_PLAN_COLS, sp.order || null, meta, hotFilterFor(sp));
       if(tok !== S.tok) return;
       raw[sp.key] = rows; S.done[sp.key] = true;
       if(meta.source === 'cache-fallback') stale[sp.key] = meta.error || 'network error';
@@ -1287,6 +1329,13 @@ async function loadAllData(opts){
       setTimeout(()=>{ if(S.tok === tok && S.status === 'ready'){ S.progress = 100; S.phase = 'Ready'; dataStateRender(); } }, 0);
       S.fromCache = Object.keys(S.srcCache).length === DATA_SPEC.length;   // cache hanya jika SEMUA tabel dari cache (offline)
       DATA_RAW = null;
+      // [PERF 2026-10 · PROGRESSIVE] Fase A selesai: pemanggil (DOMContentLoaded/retry)
+      // langsung merender dashboard dari jendela panas. Sisa data lama diisi di background
+      // oleh fillHistoryInBackground() TANPA memblokir render / interaksi user.
+      if(twoPhase){
+        S.backgroundSync = true; S.histProgress = 0; dataStateRender();
+        fillHistoryInBackground(tok, raw, hotCutoff);
+      }
     } else {
       S.status = 'partial'; S.partial = true; S.fromCache = false; S.progress = Math.min(99, S.progress + 10);
       S.error = 'Sebagian data gagal dimuat: ' + dataStateLabels(missing.concat(staleKeys));
@@ -1315,6 +1364,60 @@ async function retryDataLoad(){
   }catch(err){
     console.error('[Mineboard][retry] gagal:', err);
     renderPage();
+  }
+}
+
+/* [PERF 2026-10 · PROGRESSIVE] FASE B — history fill di background.
+   Dipanggil fire-and-forget oleh loadAllData() tepat setelah fase A (hot window)
+   berstatus ready dan pemanggil mulai merender. Menarik sisa baris LAMA
+   (dateCol < hotCutoff) per tabel fakta, menggabungkannya dengan data fase A,
+   lalu me-apply ulang model + me-render ulang halaman aktif.
+   Keamanan/anti-rusak:
+   - Dibatalkan otomatis jika load yang lebih baru dimulai (cek tok !== S.tok),
+     mis. retry manual atau refresh realtime — tidak pernah menimpa dataset baru.
+   - Tabel yang di fase A datang dari cache/offline (meta.source !== 'network')
+     SUDAH lengkap -> merge dilewatkan (mencegah baris ganda).
+   - Kegagalan fase B TIDAK fatal: dashboard tetap tampil & valid dengan data
+     jendela panas; chip kembali ke '✓ Ready' biasa. */
+async function fillHistoryInBackground(tok, hotRaw, hotCutoff){
+  const S = DATA_STATE;
+  try{
+    const factSpecs = DATA_SPEC.filter(sp=> sp.dateCol && hotRaw[sp.key] !== undefined);
+    const merged = Object.assign({}, hotRaw);
+    let done = 0;
+    for(const sp of factSpecs){
+      if(tok !== S.tok) return;   // load baru dimulai -> batal, hasil dibuang
+      const meta = {};
+      let older = null;
+      try{
+        older = await fetchAll(sp.table, sp.cols || MINE_PLAN_COLS, sp.order || null, meta,
+                               { col:sp.dateCol, op:'lt', val:hotCutoff });
+      }catch(e){
+        console.warn(`[Mineboard][history] tabel ${sp.table} gagal dimuat (tidak fatal):`, (e && e.message) || e);
+      }
+      if(tok !== S.tok) return;
+      // Hanya gabung jika benar-benar dari network: gte(cutoff) + lt(cutoff) = disjoint & lengkap.
+      // Kedua sisi terurut ascending menurut kolom tanggal yang sama -> older.concat(hot) tetap kronologis.
+      if(older && meta.source === 'network') merged[sp.key] = older.concat(hotRaw[sp.key] || []);
+      done++; S.histProgress = Math.round(done / factSpecs.length * 100); dataStateRender();
+      await _sleep(0);   // beri browser kesempatan paint antar tabel
+    }
+    if(tok !== S.tok) return;
+    S.phase = 'Processing'; dataStateRender();
+    await _sleep(0);
+    await applyLoadedTables(merged);   // invalidateFilterCache() dipanggil di dalamnya
+    if(tok !== S.tok) return;
+    S.backgroundSync = false; S.histProgress = 100;
+    DATA_LOADED_AT = new Date();
+    dataStateRender();
+    // Segarkan tampilan halaman aktif dengan dataset lengkap. Halaman input/admin
+    // (DATA_PAGE_FREE) tidak membaca model global, jadi render ulang aman untuknya.
+    try{ renderPage(); }catch(e){ console.warn('[Mineboard][history] render ulang gagal (tidak fatal):', e); }
+    console.info('[Mineboard][history] selesai — seluruh data tampil');
+  }catch(e){
+    console.warn('[Mineboard][history] gagal (tidak fatal, data jendela panas tetap tampil):', (e && e.message) || e);
+  }finally{
+    if(S.tok === tok && S.backgroundSync){ S.backgroundSync = false; dataStateRender(); }
   }
 }
 
@@ -3750,14 +3853,14 @@ function ai_buildPica(data){
         `Total Delay: <b>${ai_hours(totalDelay)}</b> (${U.fmt(delayRatio,1)}% dari total jam terjadwal)`,
         `Total Idle Unit: <b>${ai_hours(totalIdleUnit)}</b> (${U.fmt(idleRatio,1)}% dari total jam terjadwal)`,
         `Weather Idle: <b>${ai_hours(totalIdleWeather)}</b>`,
-        topDelayCauses.length ? `Penyebab Delay terbesar: <b>${topDelayCauses[0].label}</b> — ${ai_hours(topDelayCauses[0].hours)} (${U.fmt(topDelayCauses[0].pct,1)}% dari total delay)` : null
+        topDelayCauses.length ? `Penyebab Delay terbesar: <b>${esc(topDelayCauses[0].label)}</b> — ${ai_hours(topDelayCauses[0].hours)} (${U.fmt(topDelayCauses[0].pct,1)}% dari total delay)` : null
       ]);
       const causeParts = [
         `Data menunjukkan Achievement OB tertinggal ${U.fmt(gapPct,1)}% dari target. Hal ini mengindikasikan adanya kehilangan waktu produktif pada rantai availability → utilization → delay/idle.`
       ];
       if(pa<80) causeParts.push(`PA yang berada di ${U.fmt(pa,1)}% (Breakdown ${ai_hours(breakdown)}) kemungkinan menjadi salah satu penyebab utama berkurangnya kapasitas fleet efektif — <em>Shortfall produksi kemungkinan berkaitan dengan rendahnya availability.</em>`);
       if(ua<70 && totalIdleUnit>0) causeParts.push(`Kombinasi UA rendah (${U.fmt(ua,1)}%) dengan Idle Unit ${ai_hours(totalIdleUnit)} mengindikasikan sebagian unit yang tersedia belum dimanfaatkan optimal — <em>fokus tambahan diarahkan ke utilization &amp; scheduling.</em>`);
-      if(delayRatio>=3 && topDelayCauses.length) causeParts.push(`Delay menyumbang ${U.fmt(delayRatio,1)}% dari total jam terjadwal, dengan penyebab terbesar "${topDelayCauses[0].label}" (${U.fmt(topDelayCauses[0].pct,1)}% dari total delay) — <em>shortfall produksi kemungkinan berkaitan dengan kombinasi rendahnya utilization dan tingginya delay.</em>`);
+      if(delayRatio>=3 && topDelayCauses.length) causeParts.push(`Delay menyumbang ${U.fmt(delayRatio,1)}% dari total jam terjadwal, dengan penyebab terbesar "${esc(topDelayCauses[0].label)}" (${U.fmt(topDelayCauses[0].pct,1)}% dari total delay) — <em>shortfall produksi kemungkinan berkaitan dengan kombinasi rendahnya utilization dan tingginya delay.</em>`);
       causeParts.push(`Root cause pasti belum dapat dipastikan hanya dari agregat periode ini — perlu verifikasi lebih lanjut melalui distribusi delay/idle per fleet dan lokasi.`);
       const rootCauseHtml = ai_paras(causeParts);
       const impactHtml = `<p style="margin:0">Shortfall produksi OB sebesar ${U.fmt(obGap,0)} BCM (${U.fmt(gapPct,1)}%) berpotensi menggeser rencana pengupasan lapisan tanah penutup (stripping) periode berikutnya jika tidak segera dikoreksi. Jika kondisi PA/UA saat ini berlanjut tanpa tindakan, gap terhadap Mine Plan berisiko melebar pada periode selanjutnya.</p>`;
@@ -3765,7 +3868,7 @@ function ai_buildPica(data){
         `Bandingkan proporsi kontribusi PA (${U.fmt(pa,1)}%), UA (${U.fmt(ua,1)}%), Delay (${ai_hours(totalDelay)}), dan Idle (${ai_hours(totalIdleUnit)}) untuk menentukan kontributor dominan shortfall.`,
         `Jika PA dominan → prioritaskan review Breakdown pada unit/fleet dengan jam Breakdown tertinggi (lihat halaman Breakdown/Equipment).`,
         `Jika UA/Idle dominan → evaluasi penjadwalan operator/driver dan penyebab Standby/No Operator (lihat halaman Idle).`,
-        `Jika Delay dominan → fokuskan evaluasi P5M/P2H pada penyebab "${topDelayCauses[0]?.label||'-'}" (lihat halaman Delay untuk breakdown per fleet).`,
+        `Jika Delay dominan → fokuskan evaluasi P5M/P2H pada penyebab "${esc(topDelayCauses[0]?.label)||'-'}" (lihat halaman Delay untuk breakdown per fleet).`,
         `Koordinasikan dengan tim Plan/Engineering untuk menilai perlunya penyesuaian target atau catch-up plan periode berjalan.`,
         `Pantau Achievement OB harian untuk memastikan tren pemulihan menuju target.`
       ]);
@@ -3801,7 +3904,7 @@ function ai_buildPica(data){
         `UA (Utilization): <b>${U.fmt(ua,1)}%</b>`,
         `Total Delay: <b>${ai_hours(totalDelay)}</b> (${U.fmt(delayRatio,1)}% dari total jam terjadwal)`,
         `Total Idle Unit: <b>${ai_hours(totalIdleUnit)}</b> (${U.fmt(idleRatio,1)}% dari total jam terjadwal)`,
-        topDelayFleets.length ? `Fleet dengan kontribusi Delay terbesar: <b>${topDelayFleets[0].label}</b> — ${U.fmt(topDelayFleets[0].pct,1)}% dari total delay` : null
+        topDelayFleets.length ? `Fleet dengan kontribusi Delay terbesar: <b>${esc(topDelayFleets[0].label)}</b> — ${U.fmt(topDelayFleets[0].pct,1)}% dari total delay` : null
       ]);
       const rootCauseHtml = ai_paras([
         `Data menunjukkan Achievement CO tertinggal ${U.fmt(gapPct,1)}% dari target. Fleet CO umumnya lebih sedikit unitnya dibanding OB sehingga lebih sensitif terhadap Breakdown/Delay pada satu-dua unit saja.`,
@@ -3842,13 +3945,13 @@ function ai_buildPica(data){
         </div>
         <p style="margin:0">PA (Physical Availability) berada di ${U.fmt(pa,1)}%, di bawah target umum industri 80%. Total ${ai_hours(breakdown)} unit dalam status Breakdown pada periode ini mengurangi kapasitas fleet yang tersedia untuk beroperasi.</p>`;
       const evidenceHtml = ai_bullets([
-        topBreakdownUnits.length ? `Unit dengan kontribusi Breakdown terbesar: ${topBreakdownUnits.map(u=>`<b>${u.label}</b> (${ai_hours(u.hours)}, ${U.fmt(u.pct,1)}%)`).join(', ')}` : `Tidak ada rincian unit Breakdown pada periode/filter ini.`,
-        topBreakdownFleets.length ? `Fleet dengan kontribusi Breakdown terbesar: ${topBreakdownFleets.map(f=>`<b>${f.label}</b> (${U.fmt(f.pct,1)}%)`).join(', ')}` : null,
+        topBreakdownUnits.length ? `Unit dengan kontribusi Breakdown terbesar: ${topBreakdownUnits.map(u=>`<b>${esc(u.label)}</b> (${ai_hours(u.hours)}, ${U.fmt(u.pct,1)}%)`).join(', ')}` : `Tidak ada rincian unit Breakdown pada periode/filter ini.`,
+        topBreakdownFleets.length ? `Fleet dengan kontribusi Breakdown terbesar: ${topBreakdownFleets.map(f=>`<b>${esc(f.label)}</b> (${U.fmt(f.pct,1)}%)`).join(', ')}` : null,
         `UA (Utilization) pada periode yang sama: <b>${U.fmt(ua,1)}%</b>`
       ]);
       const rootCauseHtml = ai_paras([
         `Rendahnya PA terutama perlu ditelusuri melalui downtime akibat Breakdown, karena PA pada periode ini dihitung langsung dari proporsi jam Breakdown terhadap jam terjadwal.`,
-        topBreakdownUnits.length ? `Data menunjukkan kontributor Breakdown terbesar adalah unit "${topBreakdownUnits[0].label}" dengan ${ai_hours(topBreakdownUnits[0].hours)} (${U.fmt(topBreakdownUnits[0].pct,1)}% dari total Breakdown). Ini mengindikasikan masalah kemungkinan terkonsentrasi pada unit/fleet tertentu, namun perlu diverifikasi apakah bersifat berulang (recurring) melalui histori maintenance.` : `Root cause spesifik per unit belum dapat dipastikan dari data yang tersedia pada filter ini. Diperlukan verifikasi lapangan.`
+        topBreakdownUnits.length ? `Data menunjukkan kontributor Breakdown terbesar adalah unit "${esc(topBreakdownUnits[0].label)}" dengan ${ai_hours(topBreakdownUnits[0].hours)} (${U.fmt(topBreakdownUnits[0].pct,1)}% dari total Breakdown). Ini mengindikasikan masalah kemungkinan terkonsentrasi pada unit/fleet tertentu, namun perlu diverifikasi apakah bersifat berulang (recurring) melalui histori maintenance.` : `Root cause spesifik per unit belum dapat dipastikan dari data yang tersedia pada filter ini. Diperlukan verifikasi lapangan.`
       ]);
       const impactHtml = `<p style="margin:0">PA rendah tercatat bersamaan dengan sebagian unit tidak tersedia untuk operasi (${ai_hours(breakdown)} dari ${ai_hours(scheduled)} jam terjadwal). Jika kondisi ini berlangsung, kapasitas fleet efektif berkurang dan berpotensi memperbesar gap terhadap Mine Plan.</p>`;
       const actionHtml = ai_numbered([
@@ -3887,12 +3990,12 @@ function ai_buildPica(data){
       const evidenceHtml = ai_bullets([
         `Standby: <b>${ai_hours(standbyH)}</b>, No Operator: <b>${ai_hours(noOperatorH)}</b>`,
         `Total Idle Unit (lokal): <b>${ai_hours(totalIdleUnit)}</b> (${U.fmt(idleRatio,1)}% dari total jam terjadwal)`,
-        topIdleCauses.length ? `Penyebab Idle Unit terbesar: <b>${topIdleCauses[0].label}</b> — ${ai_hours(topIdleCauses[0].hours)} (${U.fmt(topIdleCauses[0].pct,1)}% dari total Idle Unit)` : null,
-        topIdleFleets.length ? `Fleet dengan kontribusi Idle terbesar: <b>${topIdleFleets[0].label}</b> (${U.fmt(topIdleFleets[0].pct,1)}%)` : null
+        topIdleCauses.length ? `Penyebab Idle Unit terbesar: <b>${esc(topIdleCauses[0].label)}</b> — ${ai_hours(topIdleCauses[0].hours)} (${U.fmt(topIdleCauses[0].pct,1)}% dari total Idle Unit)` : null,
+        topIdleFleets.length ? `Fleet dengan kontribusi Idle terbesar: <b>${esc(topIdleFleets[0].label)}</b> (${U.fmt(topIdleFleets[0].pct,1)}%)` : null
       ]);
       const rootCauseHtml = ai_paras([
         (idleRatio>=3 && topIdleCauses.length)
-          ? `Unit tersedia tetapi belum dimanfaatkan optimal — data menunjukkan Idle Unit terbesar berasal dari "${topIdleCauses[0].label}" (${U.fmt(topIdleCauses[0].pct,1)}% dari total Idle Unit). Fokus corrective action diarahkan pada utilization, operator/driver availability, dan scheduling.`
+          ? `Unit tersedia tetapi belum dimanfaatkan optimal — data menunjukkan Idle Unit terbesar berasal dari "${esc(topIdleCauses[0].label)}" (${U.fmt(topIdleCauses[0].pct,1)}% dari total Idle Unit). Fokus corrective action diarahkan pada utilization, operator/driver availability, dan scheduling.`
           : `UA rendah dengan Idle Unit yang relatif kecil mengindikasikan kemungkinan penyebab lain di luar Idle tercatat (mis. jeda antar-shift, menunggu instruksi). Perlu verifikasi lapangan lebih lanjut karena data Idle saat ini tidak menunjukkan kontributor dominan.`,
         `Data menunjukkan indikasi awal; perlu verifikasi lapangan untuk memastikan apakah penyebab utama adalah ketersediaan operator/driver, penjadwalan (roster), atau menunggu instruksi kerja.`
       ]);
@@ -3924,20 +4027,20 @@ function ai_buildPica(data){
           <div>Total Delay: <b style="color:var(--danger)">${ai_hours(totalDelay)}</b></div>
           <div>Rasio thd Jam Terjadwal: <b style="color:var(--danger)">${U.fmt(delayRatio,1)}%</b></div>
           <div>Jumlah Kejadian: <b style="color:var(--text)">${delay.length}</b></div>
-          <div>Penyebab Terbesar: <b style="color:var(--text)">${topDelayCauses[0]?.label||'-'}</b></div>
+          <div>Penyebab Terbesar: <b style="color:var(--text)">${esc(topDelayCauses[0]?.label)||'-'}</b></div>
         </div>
         <p style="margin:0">Delay menyumbang ${U.fmt(delayRatio,1)}% dari total jam terjadwal (${ai_hours(totalDelay)}) pada periode ini — di atas ambang batas wajar operasional.</p>`;
       const evidenceHtml = ai_bullets([
-        ...topDelayCauses.map(c=>`Penyebab "${c.label}": <b>${ai_hours(c.hours)}</b> (${U.fmt(c.pct,1)}% dari total Delay)`),
-        topDelayFleets.length ? `Fleet dengan kontribusi Delay terbesar: <b>${topDelayFleets[0].label}</b> (${U.fmt(topDelayFleets[0].pct,1)}%)` : null
+        ...topDelayCauses.map(c=>`Penyebab "${esc(c.label)}": <b>${ai_hours(c.hours)}</b> (${U.fmt(c.pct,1)}% dari total Delay)`),
+        topDelayFleets.length ? `Fleet dengan kontribusi Delay terbesar: <b>${esc(topDelayFleets[0].label)}</b> (${U.fmt(topDelayFleets[0].pct,1)}%)` : null
       ]);
       const rootCauseHtml = ai_paras([
-        topDelayCauses.length ? `Data menunjukkan delay terbesar berasal dari "${topDelayCauses[0].label}" sebesar ${ai_hours(topDelayCauses[0].hours)} (${U.fmt(topDelayCauses[0].pct,1)}% dari total delay). Hal ini mengindikasikan hambatan utama kemungkinan berada pada kondisi/kapasitas terkait penyebab tersebut, namun perlu diverifikasi melalui distribusi delay per fleet dan lokasi.` : null,
-        topDelayFleets.length ? `Kontribusi terbesar berasal dari fleet "${topDelayFleets[0].label}" (${U.fmt(topDelayFleets[0].pct,1)}% dari total delay) — perlu verifikasi apakah masalah spesifik pada fleet ini atau merata di semua fleet.` : null
+        topDelayCauses.length ? `Data menunjukkan delay terbesar berasal dari "${esc(topDelayCauses[0].label)}" sebesar ${ai_hours(topDelayCauses[0].hours)} (${U.fmt(topDelayCauses[0].pct,1)}% dari total delay). Hal ini mengindikasikan hambatan utama kemungkinan berada pada kondisi/kapasitas terkait penyebab tersebut, namun perlu diverifikasi melalui distribusi delay per fleet dan lokasi.` : null,
+        topDelayFleets.length ? `Kontribusi terbesar berasal dari fleet "${esc(topDelayFleets[0].label)}" (${U.fmt(topDelayFleets[0].pct,1)}% dari total delay) — perlu verifikasi apakah masalah spesifik pada fleet ini atau merata di semua fleet.` : null
       ]);
       const impactHtml = `<p style="margin:0">Delay setara ${U.fmt(delayRatio,1)}% dari total jam terjadwal adalah waktu operasi yang hilang secara langsung, berkontribusi terhadap shortfall produksi bila terjadi bersamaan dengan Achievement di bawah target.</p>`;
       const actionHtml = ai_numbered([
-        `Fokuskan evaluasi P5M/P2H pada penyebab "${topDelayCauses[0]?.label||'-'}" secara spesifik.`,
+        `Fokuskan evaluasi P5M/P2H pada penyebab "${esc(topDelayCauses[0]?.label)||'-'}" secara spesifik.`,
         `Lihat breakdown per Fleet di halaman Delay untuk menentukan apakah masalahnya di satu fleet tertentu atau merata.`,
         `Jika penyebab terkait infrastruktur (mis. hauling road), koordinasikan dengan tim Civil/Infrastructure untuk perbaikan.`,
         `Jika penyebab terkait proses kerja, evaluasi SOP terkait pada shift/fleet yang paling terdampak.`,
@@ -3946,7 +4049,7 @@ function ai_buildPica(data){
       const verificationHtml = `<p style="margin:0">Monitor rasio Delay harian (Delay/jam terjadwal) selama 7 hari berikutnya. Target: rasio Delay turun di bawah 3%. Evaluasi ulang jika target belum tercapai.</p>`;
       const targetHtml = `<p style="margin:0">Rasio Delay turun di bawah 3% dari total jam terjadwal (saat ini ${U.fmt(delayRatio,1)}%). Total Delay berkurang dari kondisi saat ini (${ai_hours(totalDelay)}).</p>`;
       const actionOwner = ai_ownerForDelay(topDelayCauses[0]?.label);
-      const priorityReason = `Delay ${U.fmt(delayRatio,1)}% dari total jam terjadwal (${ai_hours(totalDelay)}) — penyebab terbesar "${topDelayCauses[0]?.label||'-'}" (${U.fmt(topDelayCauses[0]?.pct||0,1)}%).`;
+      const priorityReason = `Delay ${U.fmt(delayRatio,1)}% dari total jam terjadwal (${ai_hours(totalDelay)}) — penyebab terbesar "${esc(topDelayCauses[0]?.label)||'-'}" (${U.fmt(topDelayCauses[0]?.pct||0,1)}%).`;
       const confidence = ai_evidenceConfidence({direct:true, contributors: topDelayCauses.length?1:0, comparison: topDelayFleets.length>0});
       const evidenceOnclick = `axViewExc('delay')`;
       pica.push({ title:'High Delay', category:'Delay', priority:lvl, severity:delayRatio, priorityReason, actionOwner, confidence, evidenceOnclick, problemHtml, evidenceHtml, rootCauseHtml, impactHtml, actionHtml, targetHtml, verificationHtml });
@@ -3962,17 +4065,17 @@ function ai_buildPica(data){
           <div>Total Idle Unit: <b style="color:var(--danger)">${ai_hours(totalIdleUnit)}</b></div>
           <div>Rasio thd Jam Terjadwal: <b style="color:var(--danger)">${U.fmt(idleRatio,1)}%</b></div>
           <div>Jumlah Kejadian: <b style="color:var(--text)">${idleUnitRows.length}</b></div>
-          <div>Penyebab Terbesar: <b style="color:var(--text)">${topIdleCauses[0]?.label||'-'}</b></div>
+          <div>Penyebab Terbesar: <b style="color:var(--text)">${esc(topIdleCauses[0]?.label)||'-'}</b></div>
         </div>
         <p style="margin:0">Idle Unit (uncontrolled standby) mencapai ${U.fmt(idleRatio,1)}% dari total jam terjadwal (${ai_hours(totalIdleUnit)}) pada periode ini.</p>`;
       const evidenceHtml = ai_bullets([
-        ...topIdleCauses.map(c=>`Penyebab "${c.label}": <b>${ai_hours(c.hours)}</b> (${U.fmt(c.pct,1)}% dari total Idle Unit)`),
-        topIdleFleets.length ? `Fleet dengan kontribusi Idle terbesar: <b>${topIdleFleets[0].label}</b> (${U.fmt(topIdleFleets[0].pct,1)}%)` : null,
+        ...topIdleCauses.map(c=>`Penyebab "${esc(c.label)}": <b>${ai_hours(c.hours)}</b> (${U.fmt(c.pct,1)}% dari total Idle Unit)`),
+        topIdleFleets.length ? `Fleet dengan kontribusi Idle terbesar: <b>${esc(topIdleFleets[0].label)}</b> (${U.fmt(topIdleFleets[0].pct,1)}%)` : null,
         `UA pada periode yang sama: <b>${U.fmt(ua,1)}%</b>`
       ]);
       const rootCauseHtml = ai_paras([
         `Unit tersedia tetapi belum dimanfaatkan optimal, sehingga fokus corrective action diarahkan pada utilization, operator/driver availability, dan scheduling.`,
-        topIdleCauses.length ? `Data menunjukkan penyebab Idle terbesar adalah "${topIdleCauses[0].label}" (${U.fmt(topIdleCauses[0].pct,1)}% dari total Idle Unit) — perlu verifikasi apakah ini berkaitan dengan ketersediaan operator, menunggu instruksi, atau scheduling.` : null
+        topIdleCauses.length ? `Data menunjukkan penyebab Idle terbesar adalah "${esc(topIdleCauses[0].label)}" (${U.fmt(topIdleCauses[0].pct,1)}% dari total Idle Unit) — perlu verifikasi apakah ini berkaitan dengan ketersediaan operator, menunggu instruksi, atau scheduling.` : null
       ]);
       const impactHtml = `<p style="margin:0">Idle Unit sebesar ${ai_hours(totalIdleUnit)} adalah kapasitas fleet yang tersedia namun tidak produktif — berkontribusi langsung terhadap rendahnya UA dan berpotensi memperbesar gap terhadap Mine Plan.</p>`;
       const actionHtml = ai_numbered([
@@ -3985,7 +4088,7 @@ function ai_buildPica(data){
       const verificationHtml = `<p style="margin:0">Monitor rasio Idle Unit harian selama 7 hari berikutnya. Target: rasio Idle turun di bawah 3%. Jika belum tercapai, lakukan evaluasi scheduling menyeluruh.</p>`;
       const targetHtml = `<p style="margin:0">Rasio Idle Unit turun di bawah 3% dari total jam terjadwal (saat ini ${U.fmt(idleRatio,1)}%). Total Idle Unit berkurang dari kondisi saat ini (${ai_hours(totalIdleUnit)}).</p>`;
       const actionOwner = 'Operation, Dispatch';
-      const priorityReason = `Idle Unit ${U.fmt(idleRatio,1)}% dari total jam terjadwal (${ai_hours(totalIdleUnit)}) — penyebab terbesar "${topIdleCauses[0]?.label||'-'}".`;
+      const priorityReason = `Idle Unit ${U.fmt(idleRatio,1)}% dari total jam terjadwal (${ai_hours(totalIdleUnit)}) — penyebab terbesar "${esc(topIdleCauses[0]?.label)||'-'}".`;
       const confidence = ai_evidenceConfidence({direct:true, contributors: topIdleCauses.length?1:0, comparison: topIdleFleets.length>0});
       const evidenceOnclick = `axViewExc('idle')`;
       pica.push({ title:'High Unit Idle', category:'Idle', priority:lvl, severity:idleRatio, priorityReason, actionOwner, confidence, evidenceOnclick, problemHtml, evidenceHtml, rootCauseHtml, impactHtml, actionHtml, targetHtml, verificationHtml });
@@ -4004,7 +4107,7 @@ function ai_buildPica(data){
         <p style="margin:0">Idle akibat cuaca (Weather Global: Rain/Slippery/Fog) mencapai ${ai_hours(totalIdleWeather)} pada periode ini, memotong waktu operasi seluruh fleet secara bersamaan (bukan hanya unit tertentu).</p>`;
       const evidenceHtml = ai_bullets(
         topWeatherCauses.length
-          ? topWeatherCauses.map(c=>`Penyebab "${c.label}": <b>${ai_hours(c.hours)}</b> (${U.fmt(c.pct,1)}% dari total Weather Idle)`)
+          ? topWeatherCauses.map(c=>`Penyebab "${esc(c.label)}": <b>${ai_hours(c.hours)}</b> (${U.fmt(c.pct,1)}% dari total Weather Idle)`)
           : [`Tidak ada rincian penyebab cuaca spesifik pada periode/filter ini.`]
       );
       const rootCauseHtml = ai_paras([
@@ -5869,7 +5972,9 @@ function showToast(msg, type='info'){
   const icon = type==='success' ? '✅' : type==='error' ? '⚠️' : 'ℹ️';
   const el = document.createElement('div');
   el.className = `adm-toast ${type}`;
-  el.innerHTML = `<span>${icon}</span><span>${msg}</span>`;
+  // [SEC 2026-10] msg selalu di-escape: toast dipakai untuk pesan error yang bisa
+  // mengandung teks dari server/DB. Pemanggil cukup kirim teks polos.
+  el.innerHTML = `<span>${icon}</span><span>${esc(msg)}</span>`;
   root.appendChild(el);
   setTimeout(()=>{ el.style.transition='opacity .3s'; el.style.opacity='0'; setTimeout(()=> el.remove(), 300); }, 3500);
 }
@@ -6139,7 +6244,7 @@ async function renderAdminAuditLogTab(wrap){
     adminAuditState.page = 1;
     drawAdminAuditLogTable();
   }catch(err){
-    document.getElementById('admAuditRoot').innerHTML = `<div class="text-xs" style="color:var(--danger)">Gagal memuat tabel <b>repair_audit_log</b>: ${err.message||err}</div>`;
+    document.getElementById('admAuditRoot').innerHTML = `<div class="text-xs" style="color:var(--danger)">Gagal memuat tabel <b>repair_audit_log</b>: ${esc(err.message||err)}</div>`;
   }
 }
 
@@ -6232,22 +6337,22 @@ function drawAdminAuditLogTable(){
     </div>
     <div class="text-xs mb-3" style="color:var(--text-faint)">Log ini khusus mencatat proses repair/perbaikan data per-field (bukan log aktivitas umum) — tidak ada kolom user/aksi/before-after JSON karena tabel sumber memang tidak memilikinya.</div>
     <div class="flex items-center gap-2 mb-3 flex-wrap no-print">
-      <input type="text" class="adm-input" id="admAuditSearchInput" style="max-width:220px" placeholder="🔎 Cari..." value="${st.search}" oninput="admAuditSetFilter('search',this.value)">
+      <input type="text" class="adm-input" id="admAuditSearchInput" style="max-width:220px" placeholder="🔎 Cari..." value="${esc(st.search)}" oninput="admAuditSetFilter('search',this.value)">
       <select class="adm-input" style="max-width:170px" onchange="admAuditSetFilter('table',this.value)">
         <option value="">Semua Tabel</option>
-        ${tableOptions.map(t=>`<option value="${t}" ${st.table===t?'selected':''}>${t}</option>`).join('')}
+        ${tableOptions.map(t=>`<option value="${esc(t)}" ${st.table===t?'selected':''}>${esc(t)}</option>`).join('')}
       </select>
       <select class="adm-input" style="max-width:170px" onchange="admAuditSetFilter('batch',this.value)">
         <option value="">Semua Batch</option>
-        ${batchOptions.map(b=>`<option value="${b}" ${st.batch===b?'selected':''}>${b}</option>`).join('')}
+        ${batchOptions.map(b=>`<option value="${esc(b)}" ${st.batch===b?'selected':''}>${esc(b)}</option>`).join('')}
       </select>
       <select class="adm-input" style="max-width:170px" onchange="admAuditSetFilter('rule',this.value)">
         <option value="">Semua Rule</option>
-        ${ruleOptions.map(rl=>`<option value="${rl}" ${st.rule===rl?'selected':''}>${rl}</option>`).join('')}
+        ${ruleOptions.map(rl=>`<option value="${esc(rl)}" ${st.rule===rl?'selected':''}>${esc(rl)}</option>`).join('')}
       </select>
-      <input type="date" class="adm-input" style="max-width:150px" value="${st.dateFrom}" onchange="admAuditSetFilter('dateFrom',this.value)">
+      <input type="date" class="adm-input" style="max-width:150px" value="${esc(st.dateFrom)}" onchange="admAuditSetFilter('dateFrom',this.value)">
       <span style="color:var(--text-faint)">s/d</span>
-      <input type="date" class="adm-input" style="max-width:150px" value="${st.dateTo}" onchange="admAuditSetFilter('dateTo',this.value)">
+      <input type="date" class="adm-input" style="max-width:150px" value="${esc(st.dateTo)}" onchange="admAuditSetFilter('dateTo',this.value)">
       ${(st.search||st.table||st.batch||st.rule||st.dateFrom||st.dateTo) ? `<button class="btn !py-1.5" onclick="admAuditResetFilter()">✕ Reset Filter</button>` : ''}
     </div>
     <div id="admAuditResultsArea"></div>
@@ -6365,7 +6470,7 @@ async function openAdminTable(section, tableKey){
     drawAdminTable(tableKey);
   }catch(err){
     if(tok !== admRenderTok) return;
-    wrap.innerHTML = `<div class="glass p-6" style="color:var(--danger)">Gagal memuat tabel "${tableKey}": ${err.message||err}</div>`;
+    wrap.innerHTML = `<div class="glass p-6" style="color:var(--danger)">Gagal memuat tabel "${esc(tableKey)}": ${esc(err.message||err)}</div>`;
   }
 }
 function admGetFilteredSorted(tableKey){
@@ -6434,7 +6539,7 @@ function admResultsHTML(tableKey){
           ${pageRows.length ? pageRows.map(r=>`
             <tr>
               ${ro ? '' : `<td class="no-print"><input type="checkbox" class="adm-checkbox" ${st.selected.has(r[cfg.pk])?'checked':''} onchange='adminToggleRow("${tableKey}", ${JSON.stringify(r[cfg.pk])})'></td>`}
-              ${cfg.listColumns.map(c=>`<td>${c.render? c.render(r[c.key],r) : (r[c.key]??'-')}</td>`).join('')}
+              ${cfg.listColumns.map(c=>`<td>${c.render? c.render(r[c.key],r) : esc(r[c.key]??'-')}</td>`).join('')}
               ${ro ? '' : `<td class="no-print"><div class="flex gap-1">
                 <button class="btn !py-1 !px-2" onclick='openAdminForm("${tableKey}", ${JSON.stringify(r[cfg.pk])})'>✏</button>
                 <button class="btn !py-1 !px-2" style="color:var(--danger)" onclick='confirmAdminDelete("${tableKey}", ${JSON.stringify(r[cfg.pk])})'>🗑</button>
@@ -6473,7 +6578,7 @@ function drawAdminTable(tableKey){
     </div>
     ${ro ? `<div class="text-xs mb-3" style="color:var(--text-faint)">Data transaksi ini berasal dari Daily Input / proses otomatis dan hanya bisa dilihat di Admin (tidak ada Tambah/Edit/Hapus/Import) agar tidak merusak proses input yang sudah ada.</div>` : ''}
     <div class="flex items-center gap-2 mb-3 flex-wrap no-print">
-      <input type="text" class="adm-input" id="admSearchInput_${tableKey}" style="max-width:220px" placeholder="Cari..." value="${st.search}" oninput="adminSearch('${tableKey}',this.value)">
+      <input type="text" class="adm-input" id="admSearchInput_${tableKey}" style="max-width:220px" placeholder="Cari..." value="${esc(st.search)}" oninput="adminSearch('${tableKey}',this.value)">
       ${ro ? '' : `<button class="btn btn-accent !py-1.5" onclick="openAdminForm('${tableKey}', null)">➕ Tambah Data</button>
       <button class="btn !py-1.5" onclick="triggerAdminImport('${tableKey}')">⬆ Import CSV</button>`}
       <button class="btn !py-1.5" onclick="adminExportCSV('${tableKey}')">⬇ CSV</button>
@@ -6505,16 +6610,18 @@ function adminClearSelection(tableKey){ adminTableState[tableKey].selected.clear
 /* ---------- FORM MODAL (ADD / EDIT) ---------- */
 function admFieldInput(col, value){
   const val = (value===undefined || value===null) ? '' : value;
-  if(col.type==='date') return `<input type="date" class="adm-input" id="admf_${col.key}" value="${val}">`;
-  if(col.type==='number') return `<input type="number" step="any" class="adm-input" id="admf_${col.key}" value="${val}">`;
+  // [SEC 2026-10] Semua nilai (dari DB) di-escape sebelum masuk atribut/HTML — mencegah
+  // attribute-breakout / stored XSS lewat form admin.
+  if(col.type==='date') return `<input type="date" class="adm-input" id="admf_${col.key}" value="${esc(val)}">`;
+  if(col.type==='number') return `<input type="number" step="any" class="adm-input" id="admf_${col.key}" value="${esc(val)}">`;
   if(col.type==='fk'){
     const opts = ADMIN_LOOKUP_CACHE[col.lookupKey] || [];
-    return `<select class="adm-select" id="admf_${col.key}"><option value="">- pilih -</option>${opts.map(o=>`<option value="${o.value}" ${String(o.value)===String(val)?'selected':''}>${o.label}</option>`).join('')}</select>`;
+    return `<select class="adm-select" id="admf_${col.key}"><option value="">- pilih -</option>${opts.map(o=>`<option value="${esc(o.value)}" ${String(o.value)===String(val)?'selected':''}>${esc(o.label)}</option>`).join('')}</select>`;
   }
   if(col.type==='enum'){
-    return `<select class="adm-select" id="admf_${col.key}"><option value="">- pilih -</option>${col.options.map(o=>`<option value="${o}" ${o===val?'selected':''}>${o}</option>`).join('')}</select>`;
+    return `<select class="adm-select" id="admf_${col.key}"><option value="">- pilih -</option>${col.options.map(o=>`<option value="${esc(o)}" ${o===val?'selected':''}>${esc(o)}</option>`).join('')}</select>`;
   }
-  return `<input type="text" class="adm-input" id="admf_${col.key}" value="${String(val).replace(/"/g,'&quot;')}">`;
+  return `<input type="text" class="adm-input" id="admf_${col.key}" value="${esc(val)}">`;
 }
 async function openAdminForm(tableKey, pk){
   const cfg = getTableConfig(tableKey);
@@ -6817,10 +6924,14 @@ window.addEventListener('DOMContentLoaded', async ()=>{
       showLoading(false);
     }
 
-    // [PERF 2026-10] loadAllData() (fetch asli ke Supabase, LENGKAP — semua tabel besar tetap
-    // ditarik penuh tanpa limit/sampling, persis seperti sebelum patch ini) SELALU dijalankan,
-    // baik cache tersedia maupun tidak. Ini satu-satunya panggilan network per pageload (tidak
-    // ada duplicate fetch): baik jalur cache maupun jalur tanpa-cache sama-sama hanya memanggil
+    // [PERF 2026-10 · PROGRESSIVE] loadAllData() SELALU dijalankan, baik cache tersedia
+    // maupun tidak. Pada boot awal TANPA data (tanpa cache), ia berjalan DUA FASE: fase A
+    // menarik tabel fakta hanya untuk HOT_WINDOW_DAYS terakhir (filter server-side) lalu
+    // langsung berstatus ready -> dashboard dirender; fase B mengisi sisa data lama di
+    // background via fillHistoryInBackground() tanpa memblokir. Jika dashboard sudah tampil
+    // dari cache, loadAllData() tetap satu fase penuh di background seperti sebelumnya.
+    // Ini satu-satunya pemicu network per pageload untuk dataset utama (tidak ada
+    // duplicate fetch): baik jalur cache maupun jalur tanpa-cache sama-sama hanya memanggil
     // loadAllData() satu kali di sini.
     await loadAllData();
     ADMIN_LAST_UPDATE = new Date();
@@ -8616,7 +8727,8 @@ function diPickChooseIdx(uid, idx){
   diSet(path, o.v, inp.dataset.redraw==='true');
 }
 function diInput(path, val, ph='', attrs='min="0" step="any"'){
-  return `<input class="adm-input" type="number" ${attrs} value="${val ?? ''}" placeholder="${ph}" oninput="diSet('${path}',this.value,false)">`;
+  // [SEC 2026-10] nilai dari state/DB di-escape sebelum masuk atribut value.
+  return `<input class="adm-input" type="number" ${attrs} value="${esc(val ?? '')}" placeholder="${esc(ph)}" oninput="diSet('${path}',this.value,false)">`;
 }
 /* [UI 2026-09] Stepper +/- kecil untuk field durasi menit (dur) — pengganti tampilan input angka
    polos di panel sekunder Support/Standby. Tetap memanggil diSet() yang sama, tidak ada field baru. */
