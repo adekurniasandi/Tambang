@@ -1181,6 +1181,8 @@ const DATA_STATE = {
   busy:false, tok:0, retries:0, loadedAt:null,
   backgroundSync:false, // [PERF 2026-10 · PROGRESSIVE] fase B history-fill sedang berjalan di background
   histProgress:0,       // [PERF 2026-10 · PROGRESSIVE] progres fase B (0-100) untuk chip
+  historyPending:null,  // [PERF 2026-10 · LAZY-HISTORY] {tok, hotCutoff} — fase B ditunda, menunggu ensureHistory()
+  historyDone:false,    // [PERF 2026-10 · LAZY-HISTORY] true jika seluruh history sudah di model
   phase:'Connecting', cacheAt:null,   // [P1 progress] Connecting > Loading data > Processing > Rendering > Ready; cacheAt = waktu cache tertua yang sedang ditampilkan
   done:{}, failed:{}, stale:{}, srcCache:{},
   modelMissing:[]        // key tabel yang TIDAK punya data sama sekali di model saat ini (bukan sekadar kosong)
@@ -1221,6 +1223,10 @@ function dataStateRender(){
   const lines = DATA_SPEC.map(sp=> (S.failed[sp.key] ? '⚠ ' : S.stale[sp.key] ? '⚠ ' : S.done[sp.key] ? '✓ ' : '… ') + sp.label + (S.failed[sp.key] ? ' — gagal' : S.stale[sp.key] ? ' — cache (server gagal)' : ''));
   c.title = (S.fromCache && S.status==='ready' ? 'Data dari cache lokal (offline), bukan server.\n' : '') + lines.join('\n');
   const g = document.getElementById('dlGatePct'); if(g) g.textContent = p + '%';
+  // [PERF 2026-10 · LAZY-HISTORY] Tombol "Muat data lama" hanya tampil saat history
+  // belum dimuat dan dashboard sudah ready (tidak sedang loading/sync).
+  const hb = document.getElementById('histBtn');
+  if(hb) hb.classList.toggle('hidden', !(S.historyPending && !S.historyDone && !S.backgroundSync && !S.busy && (S.status==='ready')));
 }
 function dataChipClick(){ if(DATA_STATE.status==='partial' || DATA_STATE.status==='error') retryDataLoad(); }
 
@@ -1328,13 +1334,24 @@ async function loadAllData(opts){
       // 100% HANYA setelah pemanggil selesai render (renderPage() berjalan sinkron setelah await loadAllData(), sebelum timer ini).
       setTimeout(()=>{ if(S.tok === tok && S.status === 'ready'){ S.progress = 100; S.phase = 'Ready'; dataStateRender(); } }, 0);
       S.fromCache = Object.keys(S.srcCache).length === DATA_SPEC.length;   // cache hanya jika SEMUA tabel dari cache (offline)
-      DATA_RAW = null;
-      // [PERF 2026-10 · PROGRESSIVE] Fase A selesai: pemanggil (DOMContentLoaded/retry)
-      // langsung merender dashboard dari jendela panas. Sisa data lama diisi di background
-      // oleh fillHistoryInBackground() TANPA memblokir render / interaksi user.
+      // [PERF 2026-10 · LAZY-HISTORY] Fase B (backfill data lama, ~27 dtk network+proses)
+      // TIDAK lagi otomatis saat boot — tampilan default (jendela panas 90 hari) sudah
+      // lengkap dari fase A. Data lama dimuat on-demand via ensureHistory()
+      // (tombol "Muat data lama" di header). DATA_RAW dipertahankan sebagai hotRaw
+      // untuk merge nanti; dilepas setelah history lengkap / load penuh berikutnya.
       if(twoPhase){
-        S.backgroundSync = true; S.histProgress = 0; dataStateRender();
-        fillHistoryInBackground(tok, raw, hotCutoff);
+        DATA_RAW = raw;
+        S.historyPending = { tok, hotCutoff };
+        S.historyDone = false;
+        S.backgroundSync = false;
+      } else if(retry){
+        // Retry: raw = gabungan DATA_RAW lama + tabel yang di-refetch — snapshot hot tetap valid.
+        DATA_RAW = raw;
+        if(S.historyPending && !S.historyDone) S.historyPending.tok = tok;
+      } else {
+        // Load penuh tanpa filter tanggal (mis. refresh background) — history sudah termasuk.
+        DATA_RAW = null;
+        S.historyPending = null; S.historyDone = true; S.backgroundSync = false;
       }
     } else {
       S.status = 'partial'; S.partial = true; S.fromCache = false; S.progress = Math.min(99, S.progress + 10);
@@ -1419,6 +1436,29 @@ async function fillHistoryInBackground(tok, hotRaw, hotCutoff){
   }finally{
     if(S.tok === tok && S.backgroundSync){ S.backgroundSync = false; dataStateRender(); }
   }
+}
+
+/* [PERF 2026-10 · LAZY-HISTORY] Pemuatan data lama on-demand (tombol "Muat data lama").
+   Aman dipanggil berulang / kapan saja:
+   - Langsung return jika history sudah lengkap, sedang berjalan, atau load sedang sibuk.
+   - Jika dataset berubah sejak fase A (tok berbeda — mis. refresh background yang
+     notabene memuat SEMUA baris tanpa filter tanggal), backfill tidak diperlukan:
+     history sudah lengkap di model. */
+async function ensureHistory(){
+  const S = DATA_STATE;
+  if(S.historyDone || S.backgroundSync || S.busy) return;
+  const pend = S.historyPending;
+  if(!pend || !DATA_RAW) return;
+  if(S.tok !== pend.tok){
+    S.historyPending = null; S.historyDone = true; dataStateRender();
+    return;
+  }
+  S.backgroundSync = true; S.histProgress = 0; dataStateRender();
+  await fillHistoryInBackground(S.tok, DATA_RAW, pend.hotCutoff);
+  // Tandai selesai HANYA jika tidak ada load baru yang dimulai selama backfill —
+  // load baru (retry/boot/refresh) sudah mengatur ulang state history-nya sendiri.
+  if(S.tok === pend.tok){ S.historyDone = true; S.historyPending = null; }
+  dataStateRender();
 }
 
 // [PERF 2026-10] Render INSTAN dari cache IndexedDB (OfflineEngine), dipakai HANYA sebagai
